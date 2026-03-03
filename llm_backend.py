@@ -25,7 +25,7 @@ class LLMBackend:
 class GeminiBackend(LLMBackend):
     """Gemini 2.5 Flash バックエンド"""
 
-    MODEL = "gemini-2.5-flash"
+    MODEL = "gemini-2.5-flash-lite"
 
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
