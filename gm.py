@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ai_player import AIPlayer
-from characters import AI_PARTNER_MAP, PLAYABLE_CHARACTERS
+from characters import PLAYABLE_CHARACTERS
 from llm_backend import GeminiBackend
 from scenarios import SCENARIOS
 from spec_loader import load_specs
@@ -40,12 +40,8 @@ GM_SYSTEM_PROMPT = """あなたはTRPGのゲームマスター（GM）です。
 - 危険な状況では適切に警告を含める
 - 楽しませることが最優先！
 
-# パーティ構成（2人パーティ）
-## 人間プレイヤー
-{character_detail}
-
-## AIパーティーメンバー
-{ai_character_detail}
+# パーティ構成
+{party_section}
 
 # 開始シナリオ
 {scenario}
@@ -107,6 +103,92 @@ def select_character() -> tuple[str, str]:
         return (selected, char["detail"])
 
 
+def select_party(human_char_name: str) -> list[tuple[str, str]]:
+    """AI仲間を選択。[(name, detail), ...] のリストを返す。"""
+    # 候補: 人間が選んだキャラ以外の名前付きキャラ
+    candidates = {
+        name: char for name, char in PLAYABLE_CHARACTERS.items()
+        if name != human_char_name and name != "オリジナル"
+    }
+
+    if not candidates:
+        return []
+
+    max_ai = min(2, len(candidates))
+
+    print(f"\n🤝 AI仲間の人数を選んでください:\n")
+    print(f"  0. ソロ冒険（仲間なし）")
+    for i in range(1, max_ai + 1):
+        if i == len(candidates):
+            print(f"  {i}. {i}人（残りのキャラ全員が仲間に）")
+        else:
+            print(f"  {i}. {i}人（残りのキャラから{i}人選択）")
+
+    while True:
+        choice = input("\n番号を入力 > ").strip()
+        try:
+            count = int(choice)
+            if 0 <= count <= max_ai:
+                break
+        except ValueError:
+            pass
+        print(f"  0〜{max_ai} の番号で選んでください。")
+
+    if count == 0:
+        return []
+
+    # 全員追加の場合は選択を省略
+    if count == len(candidates):
+        selected = [(name, char["detail"]) for name, char in candidates.items()]
+        for name, _ in selected:
+            print(f"\n✅ AI仲間: {PLAYABLE_CHARACTERS[name]['full_name']}")
+        return selected
+
+    # 1人ずつ選択
+    remaining = dict(candidates)
+    selected = []
+    for i in range(count):
+        names = list(remaining.keys())
+        print(f"\nAI仲間を選んでください（{i + 1}人目）:")
+        for j, name in enumerate(names, 1):
+            print(f"  {j}. {name} — {remaining[name]['summary']}")
+
+        while True:
+            choice = input("\n番号を入力 > ").strip()
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(names):
+                    break
+            except ValueError:
+                pass
+            print(f"  1〜{len(names)} の番号で選んでください。")
+
+        picked = names[idx]
+        selected.append((picked, remaining[picked]["detail"]))
+        print(f"\n✅ AI仲間: {PLAYABLE_CHARACTERS[picked]['full_name']}")
+        del remaining[picked]
+
+    return selected
+
+
+def build_party_section(character_detail: str, ai_members: list[tuple[str, str]]) -> str:
+    """パーティ構成セクションを構築する。"""
+    lines = ["## 人間プレイヤー", character_detail]
+
+    if ai_members:
+        lines.append("")
+        lines.append("## AIパーティーメンバー")
+        for name, detail in ai_members:
+            lines.append(f"### {name}")
+            lines.append(detail)
+        party_size = 1 + len(ai_members)
+        lines.append("")
+        lines.append(f"{party_size}人パーティとして適切な場面展開を心がけてください。")
+        lines.append("NPCとしてではなく、プレイヤーキャラクターとして扱ってください。")
+
+    return "\n".join(lines)
+
+
 def select_scenario() -> str:
     """シナリオ選択。選ばれたシナリオの説明文を返す。"""
     print("\n🗺️ シナリオを選んでください:\n")
@@ -135,13 +217,10 @@ def select_scenario() -> str:
         print(f"  1〜{len(names) + 1} の番号で選んでください。")
 
 
-def build_system_prompt(
-    character_detail: str, ai_character_detail: str, scenario: str, specs: dict[str, str]
-) -> str:
+def build_system_prompt(party_section: str, scenario: str, specs: dict[str, str]) -> str:
     """GMシステムプロンプトを構築する。"""
     return GM_SYSTEM_PROMPT.format(
-        character_detail=character_detail,
-        ai_character_detail=ai_character_detail,
+        party_section=party_section,
         scenario=scenario,
         invariants=specs["invariants"] or "（ルール未読み込み。一般的なファンタジー世界のルールで運用）",
         magic=specs["magic"] or "（未読み込み。魔法にはコストとリスクが伴うものとして扱う）",
@@ -152,7 +231,10 @@ def build_system_prompt(
 
 
 def save_session(
-    messages: list[dict], character_detail: str, ai_character_detail: str, scenario: str
+    messages: list[dict],
+    character_detail: str,
+    ai_members: list[tuple[str, str]],
+    scenario: str,
 ) -> str:
     """セッションログを Markdown 形式で保存する。"""
     sessions_dir = Path(__file__).parent / "sessions"
@@ -171,17 +253,24 @@ def save_session(
         character_detail,
         f"```",
         f"",
-        f"## AIパーティーメンバー",
-        f"```",
-        ai_character_detail,
-        f"```",
-        f"",
+    ]
+
+    if ai_members:
+        lines.append("## AIパーティーメンバー")
+        for name, detail in ai_members:
+            lines.append(f"### {name}")
+            lines.append("```")
+            lines.append(detail)
+            lines.append("```")
+            lines.append("")
+
+    lines.extend([
         f"## シナリオ",
         scenario,
         f"",
         f"## プレイログ",
         f"",
-    ]
+    ])
 
     for msg in messages:
         if msg.get("source") == "ai":
@@ -233,17 +322,25 @@ def main():
     # 4. キャラクター選択
     human_char_name, character_detail = select_character()
 
-    # 5. AI仲間の初期化
-    ai_char_name = AI_PARTNER_MAP[human_char_name]
-    ai_character_detail = PLAYABLE_CHARACTERS[ai_char_name]["detail"]
-    ai_player = AIPlayer(backend, ai_char_name, ai_character_detail)
-    print(f"\n🤝 AI仲間「{PLAYABLE_CHARACTERS[ai_char_name]['full_name']}」がパーティに加わりました！")
+    # 5. パーティ編成
+    ai_members = select_party(human_char_name)
+    ai_players = [
+        AIPlayer(backend, name, detail) for name, detail in ai_members
+    ]
+
+    # パーティ編成を表示
+    human_full = PLAYABLE_CHARACTERS.get(human_char_name, {}).get("full_name") or human_char_name
+    print(f"\n⚔ パーティ編成:")
+    print(f"  🧑 {human_full}（あなた）")
+    for name, _ in ai_members:
+        print(f"  🤖 {PLAYABLE_CHARACTERS[name]['full_name']}")
 
     # 6. シナリオ選択
     scenario = select_scenario()
 
     # 7. システムプロンプト構築
-    system_prompt = build_system_prompt(character_detail, ai_character_detail, scenario, specs)
+    party_section = build_party_section(character_detail, ai_members)
+    system_prompt = build_system_prompt(party_section, scenario, specs)
 
     # 8. オープニング生成
     print("\n" + "=" * 40)
@@ -282,7 +379,7 @@ def main():
 
         # 特殊コマンド
         if action.lower() == "save":
-            path = save_session(messages, character_detail, ai_character_detail, scenario)
+            path = save_session(messages, character_detail, ai_members, scenario)
             print(f"\n📝 セッションログを保存しました: {path}\n")
             continue
 
@@ -291,7 +388,7 @@ def main():
             if confirm in ("y", "yes", "はい"):
                 save_q = input("ログを保存しますか？ (y/n) > ").strip().lower()
                 if save_q in ("y", "yes", "はい"):
-                    path = save_session(messages, character_detail, ai_character_detail, scenario)
+                    path = save_session(messages, character_detail, ai_members, scenario)
                     print(f"\n📝 セッションログを保存しました: {path}")
                 print("\n⚔ お疲れさまでした！またエルディアでお会いしましょう。\n")
                 break
@@ -318,40 +415,42 @@ def main():
         print(f"📖 GM: {response}")
         print()
 
-        # 3. AI仲間の行動を生成
-        try:
-            ai_action = ai_player.decide_action(messages)
-        except Exception as e:
-            print(f"⚠ AI仲間の行動生成に失敗しました: {e}")
+        # 3. 各AI仲間が順番に行動
+        for ai_player in ai_players:
+            # AI仲間の行動を生成
+            try:
+                ai_action = ai_player.decide_action(messages)
+            except Exception as e:
+                print(f"⚠ {ai_player.char_name}の行動生成に失敗しました: {e}")
+                print()
+                continue
+
+            print(f"🤖 {ai_player.char_name}: {ai_action}")
             print()
-            continue
 
-        print(f"🤖 {ai_char_name}: {ai_action}")
-        print()
+            # AI仲間の行動をmessagesに追加（source メタデータ付き）
+            messages.append({
+                "role": "user",
+                "content": f"【{ai_player.char_name}】{ai_action}",
+                "source": "ai",
+                "name": ai_player.char_name,
+            })
 
-        # 4. AI仲間の行動をmessagesに追加（source メタデータ付き）
-        messages.append({
-            "role": "user",
-            "content": f"【{ai_char_name}】{ai_action}",
-            "source": "ai",
-            "name": ai_char_name,
-        })
+            # 会話履歴を制限
+            if len(messages) > MAX_HISTORY:
+                messages = messages[-MAX_HISTORY:]
 
-        # 会話履歴を制限
-        if len(messages) > MAX_HISTORY:
-            messages = messages[-MAX_HISTORY:]
+            # GM の応答（AI仲間の行動に対して）
+            try:
+                ai_response = backend.chat(system_prompt, messages)
+            except Exception as e:
+                messages.pop()  # 失敗したAI行動を履歴から除去
+                _handle_api_error(e)
+                continue
 
-        # 5. GM の応答（AI仲間の行動に対して）
-        try:
-            response2 = backend.chat(system_prompt, messages)
-        except Exception as e:
-            messages.pop()  # 失敗したAI行動を履歴から除去
-            _handle_api_error(e)
-            continue
-
-        messages.append({"role": "assistant", "content": response2})
-        print(f"📖 GM: {response2}")
-        print()
+            messages.append({"role": "assistant", "content": ai_response})
+            print(f"📖 GM: {ai_response}")
+            print()
 
 
 def _handle_api_error(e: Exception):
